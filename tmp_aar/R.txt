@@ -1,0 +1,1 @@
+int drawable icon_device_logo 0x0
