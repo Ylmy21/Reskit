@@ -107,3 +107,21 @@ adb uninstall com.example.reskit
   - 数据诊断：周期性输出 EMG 包平均到达间隔、样本数、设备时间戳增量；若无样本会提示。
 
 
+Optimizing tool selection...可以直接用 Gradle 打包：
+
+调试包（免签名配置）：
+```powershell
+cd E:\projects\andr_s\Reskit
+.\gradlew.bat assembleDebug
+```
+生成的 APK 在 app-debug.apk，可用：
+```powershell
+adb install -r app\build\outputs\apk\debug\app-debug.apk
+```
+
+发布包（需签名）：
+```powershell
+cd E:\projects\andr_s\Reskit
+.\gradlew.bat assembleRelease
+```
+生成 app-release-unsigned.apk，需要用 keystore 签名并 zipalign 后再安装；如需签名脚本或 keystore 配置，我可以帮你补。
