@@ -29,6 +29,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
@@ -197,6 +198,7 @@ fun Color.lerp(target: Color, fraction: Float): Color {
 
 private const val MAX_EMG_POINTS = 2000  // roughly 1s @2000Hz or 4s @500Hz
 private const val METRIC_SAMPLE_SKIP = 40 // compute metrics every N samples to reduce load and bar频率
+private const val CHART_THROTTLE_MS = 30L // chart update throttle (~33fps)
 
 @Composable
 fun EMGChart(data: List<Float>, modifier: Modifier = Modifier) {
@@ -423,6 +425,7 @@ fun MainScreen(context: Context) {
     var lastEmgArrivalMs by remember { mutableStateOf(0L) }
     var lastEmgDeviceTs by remember { mutableStateOf(0L) }
     var emgPacketCount by remember { mutableStateOf(0) }
+    var lastChartUpdateMs by remember { mutableStateOf(0L) }
     // streaming state
     val streaming = remember { AtomicBoolean(false) }
     var notifyListenerRef by remember { mutableStateOf<Any?>(null) }
@@ -440,6 +443,23 @@ fun MainScreen(context: Context) {
     // sensitivities for FI (freq) and FL (amp)
     var fiSensitivity by remember { mutableStateOf(1.0f) }
     var flSensitivity by remember { mutableStateOf(1.0f) }
+    var showParamDialog by remember { mutableStateOf(false) }
+    fun resetLocalState() {
+        emgSeries.clear()
+        logs.clear()
+        emgMetricCounter = 0
+        lastEmgArrivalMs = 0L
+        lastEmgDeviceTs = 0L
+        emgPacketCount = 0
+        observedMaxRms = 0f
+        baselineRms = null
+        maxRms = null
+        baselineMf = null
+        minMf = null
+        observedMinMf = 1f
+        emgFatigue = 0f
+        emgStrength = 0f
+    }
 
     // helper: compute RMS from a list of Float (use last N samples)
     fun computeRms(list: List<Float>, windowSize: Int = 64): Float {
@@ -860,33 +880,52 @@ fun MainScreen(context: Context) {
     // helper: push a new EMG sample (real BLE 回调调用此函数)
     fun pushEmgSample(sample: Float) {
         if (!measuring || !streaming.get()) return
+        val now = android.os.SystemClock.uptimeMillis()
         val s = sample // keep signed
+
+        // throttle chart/state updates on main thread
+        val shouldUpdateChart = now - lastChartUpdateMs >= CHART_THROTTLE_MS
+        if (shouldUpdateChart) lastChartUpdateMs = now
+
+        // always enqueue sample to series, but keep buffer bounded
         emgSeries.add(0, s)
         if (emgSeries.size > MAX_EMG_POINTS) emgSeries.removeLast()
+
         emgMetricCounter++
-        if (emgMetricCounter % METRIC_SAMPLE_SKIP != 0) return
-        // compute metrics
-        val list = emgSeries.toList()
-        val currRms = computeRms(list, windowSize = 64)
-        if (currRms > observedMaxRms) observedMaxRms = currRms
-        val usedMax = maxRms ?: (if (observedMaxRms > 0f) observedMaxRms else (baselineRms ?: 0.5f) * 2f)
-        val baseR = baselineRms ?: 0f
-        val denom = (usedMax - baseR).let { if (it <= 0f) 1e-6f else it }
-        val flRaw = ((currRms - baseR) / denom).coerceIn(0f, 1f)
+        val shouldCalc = emgMetricCounter % METRIC_SAMPLE_SKIP == 0
+        if (!shouldCalc && !shouldUpdateChart) return
 
-        val currMf = computeMedianFreqNormalized(list, windowSize = 128)
-        if (currMf < observedMinMf) observedMinMf = currMf
-        val baseMf = baselineMf ?: currMf
-        val minMfUsed = minMf ?: observedMinMf
-        val denomMf = (baseMf - minMfUsed).let { if (it <= 0f) 1e-6f else it }
-        val fiRaw = ((baseMf - currMf) / denomMf).coerceIn(0f, 1f)
+        // snapshot data for background calc to avoid holding main thread
+        val listSnapshot = emgSeries.toList()
 
-        val fiWeighted = fiRaw * fiSensitivity
-        val flWeighted = flRaw * flSensitivity
-        val combined = if (fiSensitivity + flSensitivity > 0f) (fiWeighted + flWeighted) / (fiSensitivity + flSensitivity) else (fiRaw + flRaw) / 2f
-        emgFatigue = (combined * fatigueIndex).coerceIn(0f, 1f)
-        val peakMean = computeTopMeanAbs(list, topN = 8)
-        emgStrength = peakMean.coerceIn(0f, 1f)
+        scope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            if (shouldCalc) {
+                val currRms = computeRms(listSnapshot, windowSize = 64)
+                val usedMaxLocal = maxRms ?: kotlin.math.max(observedMaxRms, currRms).let { if (it > 0f) it else (baselineRms ?: 0.5f) * 2f }
+                val baseRLocal = baselineRms ?: 0f
+                val denom = (usedMaxLocal - baseRLocal).let { if (it <= 0f) 1e-6f else it }
+                val flRaw = ((currRms - baseRLocal) / denom).coerceIn(0f, 1f)
+
+                val currMf = computeMedianFreqNormalized(listSnapshot, windowSize = 128)
+                val baseMfLocal = baselineMf ?: currMf
+                val minMfLocal = minMf ?: kotlin.math.min(observedMinMf, currMf)
+                val denomMf = (baseMfLocal - minMfLocal).let { if (it <= 0f) 1e-6f else it }
+                val fiRaw = ((baseMfLocal - currMf) / denomMf).coerceIn(0f, 1f)
+
+                val fiWeighted = fiRaw * fiSensitivity
+                val flWeighted = flRaw * flSensitivity
+                val combined = if (fiSensitivity + flSensitivity > 0f) (fiWeighted + flWeighted) / (fiSensitivity + flSensitivity) else (fiRaw + flRaw) / 2f
+                val fatigueVal = (combined * fatigueIndex).coerceIn(0f, 1f)
+                val peakMean = computeTopMeanAbs(listSnapshot, topN = 8).coerceIn(0f, 1f)
+
+                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    if (currRms > observedMaxRms) observedMaxRms = currRms
+                    if (currMf < observedMinMf) observedMinMf = currMf
+                    emgFatigue = fatigueVal
+                    emgStrength = peakMean
+                }
+            }
+        }
     }
 
     // helper: convert various EMG container types to float list
@@ -1190,31 +1229,7 @@ fun MainScreen(context: Context) {
                     .fillMaxSize()
                     .padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     item {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            androidx.compose.material3.TextButton(onClick = {
-                                scope.launch {
-                                    measuring = false
-                                    stopBleStreaming()
-                                    try {
-                                        val ok = callSdkDisconnect()
-                                        addLog("断开连接：$ok")
-                                    } catch (e: Exception) {
-                                        addLog("disconnect 调用异常: ${e.localizedMessage}")
-                                    }
-                                    streaming.set(false)
-                                    toastEnabled = true
-                                    devicesMap.clear(); devicesNameMap.clear();
-                                    isConnected = false
-                                    currentScreen = "home"
-                                }
-                            }) { Text("断开连接并返回") }
-
-                            Spacer(modifier = Modifier.weight(1f))
-                        }
-                    }
-
-                    item {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             if (!measuring) {
                                 Button(onClick = {
                                     val mac = selectedDeviceAddr
@@ -1235,31 +1250,82 @@ fun MainScreen(context: Context) {
                                     addLog("测量停止")
                                 }) { Text("停止测量") }
                             }
+
+                            Button(onClick = { showParamDialog = true }) { Text("调节参数") }
+
+                            Button(onClick = {
+                                scope.launch {
+                                    measuring = false
+                                    stopBleStreaming()
+                                    try {
+                                        val ok = callSdkDisconnect()
+                                        addLog("断开连接：$ok")
+                                    } catch (e: Exception) {
+                                        addLog("disconnect 调用异常: ${e.localizedMessage}")
+                                    }
+                                    streaming.set(false)
+                                    toastEnabled = true
+                                    devicesMap.clear(); devicesNameMap.clear();
+                                    try { stopScan() } catch (_: Exception) {}
+                                    resetLocalState()
+                                    isConnected = false
+                                    currentScreen = "home"
+                                }
+                            }) { Text("返回") }
                         }
                     }
 
                     item {
-                        // EMG bar summary and indices
+                        // EMG bar summary
                         EMGBar(strength = emgStrength, fatigue = emgFatigue, strengthIndex = strengthIndex, fatigueIndex = fatigueIndex, modifier = Modifier.fillMaxWidth().height(64.dp))
                     }
 
+                    // single EMG visualization
                     item {
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(text = "EMG", fontSize = 14.sp)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        EMGChartSeries(title = "EMG", data = emgSeries.toList(), modifier = Modifier.fillMaxWidth().height(200.dp))
+                    }
+                }
+            }
+
+            // main screen footer (no inline logs)
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
+        // 参数调节弹窗（全局放置，按钮控制 showParamDialog）
+        if (showParamDialog) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { showParamDialog = false },
+                title = { Text("调节参数") },
+                text = {
+                    Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("显示倍率", fontSize = 12.sp)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text("Strength Index: ${String.format("%.2f", strengthIndex)}", fontSize = 12.sp)
                                 Slider(value = strengthIndex, onValueChange = { strengthIndex = it }, valueRange = 0f..2f, modifier = Modifier.fillMaxWidth())
                             }
-                            Column(modifier = Modifier.width(110.dp)) {
-                                Text("Fatigue Index", fontSize = 12.sp)
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Fatigue Index: ${String.format("%.2f", fatigueIndex)}", fontSize = 12.sp)
                                 Slider(value = fatigueIndex, onValueChange = { fatigueIndex = it }, valueRange = 0f..2f, modifier = Modifier.fillMaxWidth())
-                                Text(text = String.format("%.2f", fatigueIndex), modifier = Modifier.align(Alignment.End), fontSize = 12.sp)
                             }
                         }
-                    }
 
-                    item {
-                        // calibration buttons row
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("灵敏度", fontSize = 12.sp)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("FI Sensitivity: ${String.format("%.2f", fiSensitivity)}", fontSize = 12.sp)
+                                Slider(value = fiSensitivity, onValueChange = { fiSensitivity = it }, valueRange = 0f..2f, modifier = Modifier.fillMaxWidth())
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("FL Sensitivity: ${String.format("%.2f", flSensitivity)}", fontSize = 12.sp)
+                                Slider(value = flSensitivity, onValueChange = { flSensitivity = it }, valueRange = 0f..2f, modifier = Modifier.fillMaxWidth())
+                            }
+                        }
+
+                        Text("校准", fontSize = 12.sp)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             androidx.compose.material3.TextButton(onClick = {
                                 val list = emgSeries.toList()
                                 val r = computeRms(list, windowSize = 128)
@@ -1274,7 +1340,8 @@ fun MainScreen(context: Context) {
                                 if (r > 0f) observedMaxRms = kotlin.math.max(observedMaxRms, r)
                                 addLog("已采集最大 RMS=${String.format("%.4f", maxRms ?: 0f)}")
                             }) { Text("最大RMS", fontSize = 12.sp) }
-
+                        }
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             androidx.compose.material3.TextButton(onClick = {
                                 val list = emgSeries.toList()
                                 val mf = computeMedianFreqNormalized(list, windowSize = 128)
@@ -1291,32 +1358,12 @@ fun MainScreen(context: Context) {
                             }) { Text("最小MF", fontSize = 12.sp) }
                         }
                     }
-
-                    item {
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("FI Sensitivity: ${String.format("%.2f", fiSensitivity)}", fontSize = 12.sp)
-                                Slider(value = fiSensitivity, onValueChange = { fiSensitivity = it }, valueRange = 0f..2f, modifier = Modifier.fillMaxWidth())
-                            }
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("FL Sensitivity: ${String.format("%.2f", flSensitivity)}", fontSize = 12.sp)
-                                Slider(value = flSensitivity, onValueChange = { flSensitivity = it }, valueRange = 0f..2f, modifier = Modifier.fillMaxWidth())
-                            }
-                        }
-                    }
-
-                    // single EMG visualization
-                    item {
-                        Text(text = "EMG", fontSize = 14.sp)
-                        Spacer(modifier = Modifier.height(4.dp))
-                        EMGChartSeries(title = "EMG", data = emgSeries.toList(), modifier = Modifier.fillMaxWidth().height(200.dp))
-                    }
+                },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = { showParamDialog = false }) { Text("关闭") }
                 }
-            }
-
-            // main screen footer (no inline logs)
-            Spacer(modifier = Modifier.height(16.dp))
-        }      
+            )
+        }
     }
 
     // end of MainScreen composable

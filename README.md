@@ -46,6 +46,12 @@ adb uninstall com.example.reskit
 - **设备可能拒绝后续访问**
   - 某些情况下连接后设备返回 onFail（args=[1]），需要重启仪器再测；请在仪器侧确认采样参数与状态。
 
+## Update Log (新增说明，不改动旧内容)
+- **UI & 控件布局调整**：测量页顶部为“开始/停止”“调节参数”“返回”三按钮同排；参数调节集中在弹窗，释放更多空间给 EMG Bar 与波形。
+- **性能与刷新节流**：EMG 指标计算节流（每 40 个样本），图表/状态更新加 30ms 节流；强度采用窗口内绝对值前 8 点均值，减少抖动。
+- **后台计算**：RMS/频域计算转至 `Dispatchers.Default`，主线程仅做快照与结果回写，降低长时间运行卡顿风险。
+- **可视化尺寸**：EMG Bar 高度 64dp，EMG 波形 200dp，提升可读性。
+
 ## 文件位置速览
 - `app/src/main/java/com/example/reskit/MainActivity.kt`：主要 UI 和 BLE 流程逻辑。
 - `app/build.gradle.kts`：应用模块依赖、Compose 启用、AAR 引用、EventBus 依赖。
