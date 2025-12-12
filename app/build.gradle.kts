@@ -53,6 +53,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
+    implementation("com.github.PhilJay:MPAndroidChart:v3.1.0")
     implementation(files("libs/ResearchKit_SDK_1.00.03.aar")) // 引用模块下的 AAR 文件
     // ResearchKit SDK 依赖 EventBus；在此添加以避免运行时找不到类
     implementation("org.greenrobot:eventbus:3.3.1")

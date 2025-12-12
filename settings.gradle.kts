@@ -16,6 +16,7 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        maven("https://jitpack.io")
         // local flat dir for .aar in app/libs
         flatDir {
             dirs("app/libs")

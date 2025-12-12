@@ -23,6 +23,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.rememberTopAppBarState
 import androidx.compose.runtime.*
 import androidx.compose.runtime.rememberCoroutineScope
@@ -31,6 +32,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.viewinterop.AndroidView
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -44,6 +47,7 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothProfile
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.content.pm.PackageManager
 import java.util.UUID
 import androidx.activity.result.contract.ActivityResultContracts
@@ -61,6 +65,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.reskit.ui.theme.ReskitTheme
+import com.github.mikephil.charting.charts.LineChart
+import com.github.mikephil.charting.components.XAxis
+import com.github.mikephil.charting.data.Entry
+import com.github.mikephil.charting.data.LineData
+import com.github.mikephil.charting.data.LineDataSet
+import android.graphics.Color as AColor
 import java.lang.reflect.InvocationHandler
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
@@ -118,11 +128,14 @@ fun EMGBar(
     fatigue: Float,
     strengthIndex: Float = 1.0f,
     fatigueIndex: Float = 1.0f,
+    strengthMax: Float = 1.0f,
     modifier: Modifier = Modifier,
     haloRadiusDp: Float = 60f
 ) {
     // apply indices to compute displayed values
-    val displayedStrength = (strength * strengthIndex).coerceIn(0f, 1f)
+    val displayedStrengthRaw = strength * strengthIndex
+    val denom = if (strengthMax <= 0f) 1f else strengthMax
+    val displayedStrength = (displayedStrengthRaw / denom).coerceIn(0f, 1f)
     val displayedFatigue = (fatigue * fatigueIndex).coerceIn(0f, 1f)
 
     fun fatigueToColor(f: Float): Color {
@@ -196,51 +209,93 @@ fun Color.lerp(target: Color, fraction: Float): Color {
     )
 }
 
-private const val MAX_EMG_POINTS = 2000  // roughly 1s @2000Hz or 4s @500Hz
-private const val METRIC_SAMPLE_SKIP = 40 // compute metrics every N samples to reduce load and bar频率
-private const val CHART_THROTTLE_MS = 30L // chart update throttle (~33fps)
+// Simple 1st-order high-pass + low-pass cascade for 20-450 Hz bandpass (default fs=2000 Hz)
+class SimpleBandpassFilter(
+    private val fs: Float = 2000f,
+    private val fLow: Float = 20f,
+    private val fHigh: Float = 450f
+) {
+    private var hpPrevY = 0f
+    private var hpPrevX = 0f
+    private var lpPrevY = 0f
 
-@Composable
-fun EMGChart(data: List<Float>, modifier: Modifier = Modifier) {
-    val pts = data.take(MAX_EMG_POINTS).reversed()
-    Box(modifier = modifier.background(Color(0xFF0B0B0B))) {
-        androidx.compose.foundation.Canvas(modifier = Modifier.matchParentSize()) {
-            val w = size.width
-            val h = size.height
-            if (pts.isEmpty()) return@Canvas
-            val maxPoints = pts.size
-            val step = if (maxPoints > 1) w / (maxPoints - 1) else w
-            // grid lines
-            val gridLevels = listOf(0f, 0.25f, 0.5f, 0.75f, 1f)
-            gridLevels.forEach { g ->
-                val y = h * g
-                drawLine(color = Color(0xFF222222), start = Offset(0f, y), end = Offset(w, y))
-            }
-            var prevX = 0f
-            var prevY = h * (1f - ((pts[0].coerceIn(-1f, 1f) + 1f) / 2f))
-            for (i in pts.indices) {
-                val x = i * step
-                val norm = (pts[i].coerceIn(-1f, 1f) + 1f) / 2f // map [-1,1] -> [0,1]
-                val y = h * (1f - norm)
-                if (i > 0) drawLine(color = Color(0xFF00E676), start = Offset(prevX, prevY), end = Offset(x, y), strokeWidth = 4f)
-                prevX = x; prevY = y
-            }
-        }
+    fun reset() {
+        hpPrevY = 0f; hpPrevX = 0f; lpPrevY = 0f
+    }
+
+    fun process(x: Float): Float {
+        val dt = 1f / fs
+        // high-pass alpha = RC/(RC+dt)
+        val rcHigh = 1f / (2f * Math.PI.toFloat() * fLow)
+        val alphaHp = rcHigh / (rcHigh + dt)
+        val yHp = alphaHp * (hpPrevY + x - hpPrevX)
+        hpPrevY = yHp
+        hpPrevX = x
+
+        // low-pass alpha = dt/(RC+dt)
+        val rcLow = 1f / (2f * Math.PI.toFloat() * fHigh)
+        val alphaLp = dt / (rcLow + dt)
+        val yLp = lpPrevY + alphaLp * (yHp - lpPrevY)
+        lpPrevY = yLp
+        return yLp
     }
 }
 
+private const val MAX_EMG_POINTS = 5000  // retain history buffer
+private const val CHART_WINDOW_POINTS = 1000 // ~5s window at 200 Hz, fill one screen
+private const val STRENGTH_WINDOW_POINTS = 1000 // strength trend window (~5s)
+private const val METRIC_SAMPLE_SKIP = 4 // compute metrics every N samples at 200 Hz input (~50 Hz metrics)
+private const val CHART_THROTTLE_MS = 20L // chart update throttle (~50fps)
+
 @Composable
-fun EMGChartSeries(title: String, data: List<Float>, modifier: Modifier = Modifier) {
-    Row(modifier = modifier) {
-        Column(modifier = Modifier.width(40.dp).padding(end = 6.dp), verticalArrangement = Arrangement.SpaceBetween) {
-            Text("+1", fontSize = 12.sp)
-            Text("0", fontSize = 12.sp)
-            Text("-1", fontSize = 12.sp)
+fun EMGRawLineChart(title: String, data: List<Float>, centerBias: Float?, modifier: Modifier = Modifier) {
+    AndroidView(
+        modifier = modifier,
+        factory = { ctx ->
+            LineChart(ctx).apply {
+                description.isEnabled = false
+                setNoDataText("无数据")
+                setBackgroundColor(AColor.WHITE)
+                setTouchEnabled(true)
+                setScaleEnabled(true)
+                isDragEnabled = false
+                setPinchZoom(true)
+                axisRight.isEnabled = false
+                axisLeft.apply {
+                    textColor = AColor.BLACK
+                    setDrawGridLines(false)
+                    setDrawAxisLine(true)
+                    setDrawZeroLine(false)
+                    setDrawGridLinesBehindData(false)
+                    isGranularityEnabled = true
+                    granularity = 10f
+                }
+                xAxis.apply {
+                    position = XAxis.XAxisPosition.BOTTOM
+                    setDrawGridLines(false)
+                    textColor = AColor.BLACK
+                    setDrawAxisLine(true)
+                    isGranularityEnabled = true
+                    granularity = 10f
+                }
+                legend.isEnabled = false
+            }
+        },
+        update = { chart ->
+            val window = data.takeLast(CHART_WINDOW_POINTS)
+            val bias = centerBias ?: 0f
+            val entries = window.mapIndexed { idx, v -> Entry(idx.toFloat(), v - bias) }
+            val dataSet = LineDataSet(entries, title).apply {
+                color = AColor.BLACK
+                lineWidth = 1.2f
+                setDrawCircles(false)
+                setDrawValues(false)
+                setDrawHighlightIndicators(false)
+            }
+            chart.data = LineData(dataSet)
+            chart.invalidate()
         }
-        Box(modifier = Modifier.fillMaxSize().background(Color(0xFF0B0B0B))) {
-            EMGChart(data = data, modifier = Modifier.matchParentSize())
-        }
-    }
+    )
 }
 
 
@@ -282,6 +337,20 @@ fun MainScreen(context: Context) {
     // EMG visualization state: strength [0f..1f], fatigue [0f..1f]
     var emgStrength by remember { mutableStateOf(0.25f) }
     var emgFatigue by remember { mutableStateOf(0.0f) }
+    val strengthSeries = remember { mutableStateListOf<Float>() }
+    var lastEmgSampleRealtime by remember { mutableStateOf(0L) }
+    var sampleLagMs by remember { mutableStateOf(0L) }
+    var emgDataSource by remember { mutableStateOf("emg") } // "emg" or "sensor"
+    var centerToZero by remember { mutableStateOf(false) }
+
+    // periodic latency updater
+    LaunchedEffect(Unit) {
+        while (true) {
+            val now = SystemClock.elapsedRealtime()
+            if (lastEmgSampleRealtime > 0) sampleLagMs = (now - lastEmgSampleRealtime).coerceAtLeast(0L)
+            kotlinx.coroutines.delay(500)
+        }
+    }
     // BLE scan state
     var scanning by remember { mutableStateOf(false) }
     val devicesMap = remember { mutableStateMapOf<String, BluetoothDevice>() }
@@ -426,11 +495,13 @@ fun MainScreen(context: Context) {
     var lastEmgDeviceTs by remember { mutableStateOf(0L) }
     var emgPacketCount by remember { mutableStateOf(0) }
     var lastChartUpdateMs by remember { mutableStateOf(0L) }
+    var lastDisplayMs by remember { mutableStateOf(0L) }
     // streaming state
     val streaming = remember { AtomicBoolean(false) }
     var notifyListenerRef by remember { mutableStateOf<Any?>(null) }
     // tunable indices for EMGBar
     var strengthIndex by remember { mutableStateOf(1.0f) }
+    var strengthMax by remember { mutableStateOf(200.0f) }
     var fatigueIndex by remember { mutableStateOf(1.0f) }
     // calibration values for RMS-based fatigue estimation
     var baselineRms by remember { mutableStateOf<Float?>(null) }
@@ -446,6 +517,7 @@ fun MainScreen(context: Context) {
     var showParamDialog by remember { mutableStateOf(false) }
     fun resetLocalState() {
         emgSeries.clear()
+        strengthSeries.clear()
         logs.clear()
         emgMetricCounter = 0
         lastEmgArrivalMs = 0L
@@ -459,6 +531,7 @@ fun MainScreen(context: Context) {
         observedMinMf = 1f
         emgFatigue = 0f
         emgStrength = 0f
+        strengthMax = 200f
     }
 
     // helper: compute RMS from a list of Float (use last N samples)
@@ -471,12 +544,17 @@ fun MainScreen(context: Context) {
         return kotlin.math.sqrt((s / slice.size).toFloat())
     }
 
-    // compute mean of top-N absolute samples to smooth bar and emphasize高幅值
-    fun computeTopMeanAbs(list: List<Float>, topN: Int = 8): Float {
+    // compute mean absolute deviation from the window mean
+    fun computeMeanAbs(list: List<Float>, windowSize: Int = 50): Float {
         if (list.isEmpty()) return 0f
-        val n = topN.coerceAtLeast(1).coerceAtMost(list.size)
-        val sorted = list.asSequence().map { kotlin.math.abs(it) }.sortedDescending().take(n).toList()
-        return (sorted.sum() / sorted.size).toFloat()
+        val n = windowSize.coerceAtMost(list.size)
+        val slice = list.takeLast(n)
+        val mean = slice.sumOf { it.toDouble() } / slice.size
+        val deviations = slice.map { kotlin.math.abs(it - mean) }
+        if (deviations.size <= 10) return deviations.average().toFloat()
+        val sorted = deviations.sorted()
+        val trimmed = sorted.subList(5, sorted.size - 5)
+        return (trimmed.sum() / trimmed.size).toFloat()
     }
 
     // compute normalized median frequency [0..1] using naive DFT (suitable for small N)
@@ -877,19 +955,25 @@ fun MainScreen(context: Context) {
 
             } // end of home UI block
 
+    val bpFilter = remember { SimpleBandpassFilter(fs = 2000f, fLow = 20f, fHigh = 450f) }
+
     // helper: push a new EMG sample (real BLE 回调调用此函数)
     fun pushEmgSample(sample: Float) {
         if (!measuring || !streaming.get()) return
         val now = android.os.SystemClock.uptimeMillis()
-        val s = sample // keep signed
+        val s = bpFilter.process(sample) // bandpass-filtered, keep signed
+
+        // limit display rate to ~200 Hz
+        if (now - lastDisplayMs < 5L) return else lastDisplayMs = now
 
         // throttle chart/state updates on main thread
         val shouldUpdateChart = now - lastChartUpdateMs >= CHART_THROTTLE_MS
         if (shouldUpdateChart) lastChartUpdateMs = now
 
         // always enqueue sample to series, but keep buffer bounded
-        emgSeries.add(0, s)
-        if (emgSeries.size > MAX_EMG_POINTS) emgSeries.removeLast()
+        emgSeries.add(s)
+        if (emgSeries.size > MAX_EMG_POINTS) emgSeries.removeFirst()
+        lastEmgSampleRealtime = SystemClock.elapsedRealtime()
 
         emgMetricCounter++
         val shouldCalc = emgMetricCounter % METRIC_SAMPLE_SKIP == 0
@@ -900,13 +984,13 @@ fun MainScreen(context: Context) {
 
         scope.launch(kotlinx.coroutines.Dispatchers.Default) {
             if (shouldCalc) {
-                val currRms = computeRms(listSnapshot, windowSize = 64)
+                val currRms = computeRms(listSnapshot, windowSize = 50)
                 val usedMaxLocal = maxRms ?: kotlin.math.max(observedMaxRms, currRms).let { if (it > 0f) it else (baselineRms ?: 0.5f) * 2f }
                 val baseRLocal = baselineRms ?: 0f
                 val denom = (usedMaxLocal - baseRLocal).let { if (it <= 0f) 1e-6f else it }
                 val flRaw = ((currRms - baseRLocal) / denom).coerceIn(0f, 1f)
 
-                val currMf = computeMedianFreqNormalized(listSnapshot, windowSize = 128)
+                val currMf = computeMedianFreqNormalized(listSnapshot, windowSize = 50)
                 val baseMfLocal = baselineMf ?: currMf
                 val minMfLocal = minMf ?: kotlin.math.min(observedMinMf, currMf)
                 val denomMf = (baseMfLocal - minMfLocal).let { if (it <= 0f) 1e-6f else it }
@@ -916,13 +1000,15 @@ fun MainScreen(context: Context) {
                 val flWeighted = flRaw * flSensitivity
                 val combined = if (fiSensitivity + flSensitivity > 0f) (fiWeighted + flWeighted) / (fiSensitivity + flSensitivity) else (fiRaw + flRaw) / 2f
                 val fatigueVal = (combined * fatigueIndex).coerceIn(0f, 1f)
-                val peakMean = computeTopMeanAbs(listSnapshot, topN = 8).coerceIn(0f, 1f)
+                val strengthMeanAbs = computeMeanAbs(listSnapshot, windowSize = 50)
 
                 withContext(kotlinx.coroutines.Dispatchers.Main) {
                     if (currRms > observedMaxRms) observedMaxRms = currRms
                     if (currMf < observedMinMf) observedMinMf = currMf
                     emgFatigue = fatigueVal
-                    emgStrength = peakMean
+                    emgStrength = strengthMeanAbs
+                    strengthSeries.add(emgStrength)
+                    if (strengthSeries.size > STRENGTH_WINDOW_POINTS) strengthSeries.removeFirst()
                 }
             }
         }
@@ -943,7 +1029,7 @@ fun MainScreen(context: Context) {
     }
 
     // helper: convert EMG short[] to normalized floats
-    fun fromShortArray(arr: ShortArray): List<Float> = arr.map { it.toFloat() / 32768f }
+    fun fromShortArray(arr: ShortArray): List<Float> = arr.map { it.toFloat() }
 
     // helper: read static int constant from candidate classes via reflection
     fun getConst(classNames: List<String>, fieldName: String): Int? {
@@ -997,6 +1083,7 @@ fun MainScreen(context: Context) {
             addLog("未选择设备，无法启动 EMG 采集")
             return
         }
+        bpFilter.reset()
         try {
             val pmCls = Class.forName("com.goertek.protocol.ProtocolManager")
             val pm = pmCls.getMethod("getInstance").invoke(null)
@@ -1060,29 +1147,29 @@ fun MainScreen(context: Context) {
                                 val isSensorReport = (serviceSensor == null || serviceId?.toInt() == serviceSensor) && (cmdSensorReport == null || commandId?.toInt() == cmdSensorReport)
                                 val isEmgUpload = (serviceEmg != null && serviceId?.toInt() == serviceEmg) && (cmdEmgUpload == null || commandId?.toInt() == cmdEmgUpload)
 
-                                if (isSensorReport && appData != null) {
+                                if (emgDataSource == "sensor" && isSensorReport && appData != null) {
                                     try {
                                         val helperCls = resolveClass(listOf("com.goertek.protocol.mbb.MBBAppDataHelper", "com.goertek.protocol.MBBAppDataHelper", "com.goertek.protocol.utils.MBBAppDataHelper"))
                                         if (helperCls == null) throw ClassNotFoundException("MBBAppDataHelper")
                                         val parser = helperCls.methods.firstOrNull { it.name == "parserSensorData" && it.parameterTypes.size == 1 }
                                         val parsed = parser?.invoke(null, appData)
                                         if (parsed != null) {
-                                            val values: List<Float>? = extractEmgValues(parsed)
-                                            if (!values.isNullOrEmpty()) {
-                                                values.forEach { pushEmgSample(it) }
-                                            } else if (appData.isNotEmpty()) {
-                                                pushEmgSample((appData[0].toInt() and 0xFF) / 255f)
-                                            }
-                                        } else if (appData.isNotEmpty()) {
-                                            pushEmgSample((appData[0].toInt() and 0xFF) / 255f)
-                                        }
+                                                    val values: List<Float>? = extractEmgValues(parsed)
+                                                    if (!values.isNullOrEmpty()) {
+                                                        values.forEach { pushEmgSample(it) }
+                                                    } else if (appData.isNotEmpty()) {
+                                                        pushEmgSample((appData[0].toInt() and 0xFF).toFloat())
+                                                    }
+                                                } else if (appData.isNotEmpty()) {
+                                                    pushEmgSample((appData[0].toInt() and 0xFF).toFloat())
+                                                }
                                     } catch (e: Exception) {
-                                        if (appData != null && appData.isNotEmpty()) {
-                                            pushEmgSample((appData[0].toInt() and 0xFF) / 255f)
-                                        }
+                                                if (appData != null && appData.isNotEmpty()) {
+                                                    pushEmgSample((appData[0].toInt() and 0xFF).toFloat())
+                                                }
                                         addLog("解析传感数据异常: ${e.localizedMessage}")
                                     }
-                                } else if (isEmgUpload && appData != null) {
+                                } else if (emgDataSource == "emg" && isEmgUpload && appData != null) {
                                     try {
                                         val helperCls = resolveClass(listOf("com.goertek.protocol.mbb.MBBAppDataHelper", "com.goertek.protocol.MBBAppDataHelper", "com.goertek.protocol.utils.MBBAppDataHelper"))
                                         val emgDataCls = resolveClass(listOf("com.goertek.protocol.mbb.entity.EMGSampleData"))
@@ -1277,14 +1364,31 @@ fun MainScreen(context: Context) {
 
                     item {
                         // EMG bar summary
-                        EMGBar(strength = emgStrength, fatigue = emgFatigue, strengthIndex = strengthIndex, fatigueIndex = fatigueIndex, modifier = Modifier.fillMaxWidth().height(64.dp))
+                        EMGBar(strength = emgStrength, fatigue = emgFatigue, strengthIndex = strengthIndex, fatigueIndex = fatigueIndex, strengthMax = strengthMax, modifier = Modifier.fillMaxWidth().height(64.dp))
                     }
 
-                    // single EMG visualization
+                    // EMG raw line chart (5s window, no grid)
                     item {
-                        Text(text = "EMG", fontSize = 14.sp)
+                        val window = emgSeries.takeLast(CHART_WINDOW_POINTS)
+                        fun medianOf(list: List<Float>): Float {
+                            if (list.isEmpty()) return 0f
+                            val sorted = list.sorted()
+                            val mid = sorted.size / 2
+                            return if (sorted.size % 2 == 0) (sorted[mid - 1] + sorted[mid]) / 2f else sorted[mid]
+                        }
+                        val bias = if (centerToZero && window.isNotEmpty()) medianOf(window) else 0f
+                        val wMin = window.minOrNull() ?: 0f
+                        val wMax = window.maxOrNull() ?: 0f
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Column {
+                                Text(text = "EMG Raw", fontSize = 14.sp)
+                                Text(text = "bias=${"%.2f".format(bias)}  min=${"%.1f".format(wMin)}  max=${"%.1f".format(wMax)}", fontSize = 11.sp, color = Color.Gray)
+                            }
+                            Text(text = "lag ≈ ${sampleLagMs} ms", fontSize = 12.sp, color = Color.Gray)
+                        }
                         Spacer(modifier = Modifier.height(4.dp))
-                        EMGChartSeries(title = "EMG", data = emgSeries.toList(), modifier = Modifier.fillMaxWidth().height(200.dp))
+                        EMGRawLineChart(title = "EMG Raw", data = emgSeries.toList(), centerBias = if (centerToZero) bias else null, modifier = Modifier.fillMaxWidth().height(200.dp))
                     }
                 }
             }
@@ -1295,6 +1399,10 @@ fun MainScreen(context: Context) {
 
         // 参数调节弹窗（全局放置，按钮控制 showParamDialog）
         if (showParamDialog) {
+            // 输入框文本与外部值同步
+            var strengthMaxInput by remember { mutableStateOf(strengthMax.toString()) }
+            LaunchedEffect(strengthMax) { strengthMaxInput = strengthMax.toString() }
+
             androidx.compose.material3.AlertDialog(
                 onDismissRequest = { showParamDialog = false },
                 title = { Text("调节参数") },
@@ -1311,6 +1419,36 @@ fun MainScreen(context: Context) {
                                 Slider(value = fatigueIndex, onValueChange = { fatigueIndex = it }, valueRange = 0f..2f, modifier = Modifier.fillMaxWidth())
                             }
                         }
+
+                        Text("数据源", fontSize = 12.sp)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                RadioButton(selected = emgDataSource == "emg", onClick = { emgDataSource = "emg" })
+                                Text("parserEMGData", fontSize = 12.sp)
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                RadioButton(selected = emgDataSource == "sensor", onClick = { emgDataSource = "sensor" })
+                                Text("parserSensorData", fontSize = 12.sp)
+                            }
+                        }
+
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = centerToZero, onCheckedChange = { centerToZero = it })
+                            Text("波形平移至0（用当前窗口中值）", fontSize = 12.sp)
+                        }
+
+                        Text("EMG Bar 最大值 (0~2000)", fontSize = 12.sp)
+                        OutlinedTextField(
+                            value = strengthMaxInput,
+                            onValueChange = { txt ->
+                                strengthMaxInput = txt
+                                val v = txt.toFloatOrNull()
+                                if (v != null) strengthMax = v.coerceIn(0f, 2000f)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            placeholder = { Text("例如 1000") }
+                        )
 
                         Text("灵敏度", fontSize = 12.sp)
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
