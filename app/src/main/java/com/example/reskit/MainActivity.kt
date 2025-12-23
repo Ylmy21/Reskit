@@ -284,8 +284,9 @@ class ButterworthBandpassFilter(
 private const val MAX_EMG_POINTS = 5000  // retain history buffer
 private const val CHART_WINDOW_POINTS = 1000 // ~5s window at 200 Hz, fill one screen
 private const val STRENGTH_WINDOW_POINTS = 1000 // strength trend window (~5s)
-private const val METRIC_SAMPLE_SKIP = 4 // compute metrics every N samples at 200 Hz input (~50 Hz metrics)
+private const val METRIC_SAMPLE_SKIP = 20 // compute metrics every N samples at ~1000 Hz input (~50 Hz metrics)
 private const val CHART_THROTTLE_MS = 20L // chart update throttle (~50fps)
+private const val BASELINE_WINDOW_SAMPLES = 300 // ~300 ms at 1000 Hz for baseline median subtraction
 
 @Composable
 fun EMGRawLineChart(title: String, data: List<Float>, centerBias: Float?, modifier: Modifier = Modifier) {
@@ -345,6 +346,7 @@ fun MainScreen(context: Context) {
     var mac by remember { mutableStateOf("") }
     val logs = remember { mutableStateListOf<String>() }
     val rawCapture = remember { mutableStateListOf<Float>() }
+    val baselineWindow = remember { mutableStateListOf<Float>() }
     var measurementStartMs by remember { mutableStateOf(0L) }
     val rawPacketCapture = remember { mutableStateListOf<Short>() }
     var totalPacketSamples by remember { mutableStateOf(0L) }
@@ -379,6 +381,58 @@ fun MainScreen(context: Context) {
         }
     }
 
+    fun forceResetFilter(filter: ButterworthBandpassFilter) {
+        filter.reset()
+        addLog("手动重置滤波器，后续输出将重新稳定")
+    }
+
+    // 简单原始记录（直接从输入通路采集样本，不做滤波/抽样）
+    var simpleRawRecording by remember { mutableStateOf(false) }
+    var simpleRawStartMs by remember { mutableStateOf(0L) }
+    val simpleRawBuffer = remember { mutableStateListOf<Float>() }
+
+    fun startSimpleRawRecording() {
+        simpleRawBuffer.clear()
+        simpleRawStartMs = SystemClock.elapsedRealtime()
+        simpleRawRecording = true
+        addLog("原始记录开始")
+    }
+
+    fun stopAndSaveSimpleRawRecording() {
+        val data = simpleRawBuffer.toList()
+        simpleRawRecording = false
+        val durSec = if (simpleRawStartMs > 0L) ((SystemClock.elapsedRealtime() - simpleRawStartMs).coerceAtLeast(0L) / 1000L) else 0L
+        if (data.isEmpty()) {
+            Handler(Looper.getMainLooper()).post { Toast.makeText(context, "无原始数据可保存", Toast.LENGTH_SHORT).show() }
+            addLog("无原始数据可保存")
+            return
+        }
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        Handler(Looper.getMainLooper()).post { Toast.makeText(context, "保存原始记录...", Toast.LENGTH_SHORT).show() }
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val file = File(context.getExternalFilesDir(null), "emg_raw_${ts}_${durSec}s.csv")
+                file.bufferedWriter().use { out ->
+                    data.forEachIndexed { idx, v ->
+                        out.append(idx.toString())
+                        out.append(',')
+                        out.append(v.toString())
+                        out.append('\n')
+                    }
+                }
+                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    addLog("原始记录已保存: ${file.absolutePath}")
+                    Toast.makeText(context, "保存完成: ${file.name}", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    addLog("保存原始记录失败: ${e.localizedMessage}")
+                    Toast.makeText(context, "保存失败: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
     fun exportRawCapture() {
         if (rawCapture.isEmpty()) {
             addLog("无原始数据可导出")
@@ -396,7 +450,8 @@ fun MainScreen(context: Context) {
             try {
                 val file = File(context.getExternalFilesDir(null), "emg_raw_${ts}_${durSec}s.csv")
                 file.bufferedWriter().use { out ->
-                    val data = if (rawPacketCapture.isNotEmpty()) rawPacketCapture.map { it.toFloat() } else rawCapture.toList()
+                    // 导出 1000 Hz 采样的“真实”单点序列：使用 pushEmgSample 入口处的 rawCapture
+                    val data = rawCapture.toList()
                     data.forEachIndexed { idx, v ->
                         out.append(idx.toString())
                         out.append(',')
@@ -1047,21 +1102,29 @@ fun MainScreen(context: Context) {
 
             } // end of home UI block
 
-    val bpFilter = remember { ButterworthBandpassFilter(fs = 2000f, fLow = 20f, fHigh = 450f) }
+    val bpFilter = remember { ButterworthBandpassFilter(fs = 1000f, fLow = 20f, fHigh = 450f) }
 
     // helper: push a new EMG sample (real BLE 回调调用此函数)
     fun pushEmgSample(sample: Float) {
         if (!measuring || !streaming.get()) return
         val now = android.os.SystemClock.uptimeMillis()
+
         rawCapture.add(sample)
-        val s = bpFilter.process(sample) // bandpass-filtered, keep signed
+        baselineWindow.add(sample)
+        if (baselineWindow.size > BASELINE_WINDOW_SAMPLES) baselineWindow.removeFirst()
+        val baseline = if (baselineWindow.isNotEmpty()) {
+            val sorted = baselineWindow.sorted()
+            val mid = sorted.size / 2
+            if (sorted.size % 2 == 0) (sorted[mid - 1] + sorted[mid]) / 2f else sorted[mid]
+        } else 0f
+        val s = bpFilter.process(sample - baseline) // bandpass-filtered after short-window baseline removal
 
         // keep full-rate filtered series for reference (bounded)
         emgSeriesFull.add(s)
         if (emgSeriesFull.size > MAX_EMG_POINTS * 4) emgSeriesFull.removeFirst()
 
-        // decimate to ~200 Hz for chart/metrics (every 10 samples at 2000 Hz)
-        chartDecimateCounter = (chartDecimateCounter + 1) % 10
+        // decimate to ~200 Hz for chart only (every 5 samples at ~1000 Hz)
+        chartDecimateCounter = (chartDecimateCounter + 1) % 5
         val shouldAppendChart = chartDecimateCounter == 0
 
         // throttle chart/state updates on main thread
@@ -1078,8 +1141,8 @@ fun MainScreen(context: Context) {
         val shouldCalc = emgMetricCounter % METRIC_SAMPLE_SKIP == 0
         if (!shouldCalc && !shouldUpdateChart) return
 
-        // snapshot data for background calc to avoid holding main thread
-        val listSnapshot = emgSeries.toList()
+        // snapshot data for background calc to avoid holding main thread (use full-rate series)
+        val listSnapshot = emgSeriesFull.toList()
 
         scope.launch(kotlinx.coroutines.Dispatchers.Default) {
             if (shouldCalc) {
@@ -1247,26 +1310,25 @@ fun MainScreen(context: Context) {
                                 val isEmgUpload = (serviceEmg != null && serviceId?.toInt() == serviceEmg) && (cmdEmgUpload == null || commandId?.toInt() == cmdEmgUpload)
 
                                 if (emgDataSource == "sensor" && isSensorReport && appData != null) {
-                                    try {
-                                        val helperCls = resolveClass(listOf("com.goertek.protocol.mbb.MBBAppDataHelper", "com.goertek.protocol.MBBAppDataHelper", "com.goertek.protocol.utils.MBBAppDataHelper"))
-                                        if (helperCls == null) throw ClassNotFoundException("MBBAppDataHelper")
-                                        val parser = helperCls.methods.firstOrNull { it.name == "parserSensorData" && it.parameterTypes.size == 1 }
-                                        val parsed = parser?.invoke(null, appData)
-                                        if (parsed != null) {
-                                                    val values: List<Float>? = extractEmgValues(parsed)
-                                                    if (!values.isNullOrEmpty()) {
-                                                        values.forEach { pushEmgSample(it) }
-                                                    } else if (appData.isNotEmpty()) {
-                                                        pushEmgSample((appData[0].toInt() and 0xFF).toFloat())
-                                                    }
-                                                } else if (appData.isNotEmpty()) {
-                                                    pushEmgSample((appData[0].toInt() and 0xFF).toFloat())
-                                                }
-                                    } catch (e: Exception) {
-                                                if (appData != null && appData.isNotEmpty()) {
-                                                    pushEmgSample((appData[0].toInt() and 0xFF).toFloat())
-                                                }
-                                        addLog("解析传感数据异常: ${e.localizedMessage}")
+                                    // Treat sensor path as raw EMG bytes: little-endian short stream; keep 1-of-9 real per group
+                                    val groupSize = 9
+                                    var i = 0
+                                    while (i + 1 < appData.size) {
+                                        val endByte = kotlin.math.min(i + groupSize * 2, appData.size)
+                                        // build shorts for this group
+                                        var j = i
+                                        var realFound = false
+                                        while (j + 1 < endByte) {
+                                            val v: Short = (((appData[j + 1].toInt() and 0xFF) shl 8) or (appData[j].toInt() and 0xFF)).toShort()
+                                            if (!realFound && v.toInt() != 0) {
+                                                pushEmgSample(v.toFloat())
+                                                realFound = true
+                                                // also record in simple raw buffer if active
+                                                if (simpleRawRecording) simpleRawBuffer.add(v.toFloat())
+                                            }
+                                            j += 2
+                                        }
+                                        i = endByte
                                     }
                                 } else if (emgDataSource == "emg" && isEmgUpload && appData != null) {
                                     try {
@@ -1280,16 +1342,22 @@ fun MainScreen(context: Context) {
                                             val values = mutableListOf<Float>()
                                             val now = System.currentTimeMillis()
                                             emgPacketCount += 1
+                                            val groupSize = 9
                                             emgDatas?.forEach { any ->
                                                 try {
                                                     val shortArr = any?.javaClass?.getDeclaredField("emgData")?.apply { isAccessible = true }?.get(any) as? ShortArray
                                                     if (shortArr != null) {
-                                                        rawPacketCapture.addAll(shortArr.asList())
-                                                        val nonZero = shortArr.filter { it.toInt() != 0 }
-                                                        totalPacketSamples += shortArr.size
-                                                        totalPacketNonZero += nonZero.size
-                                                        if (nonZero.isNotEmpty()) {
-                                                            values.addAll(nonZero.map { it.toFloat() })
+                                                        var i = 0
+                                                        while (i < shortArr.size) {
+                                                            val end = kotlin.math.min(i + groupSize, shortArr.size)
+                                                            val real = shortArr.slice(i until end).firstOrNull { it.toInt() != 0 }
+                                                            totalPacketSamples += (end - i)
+                                                            if (real != null) {
+                                                                totalPacketNonZero += 1
+                                                                rawPacketCapture.add(real)
+                                                                values.add(real.toFloat())
+                                                            }
+                                                            i = end
                                                         }
                                                     }
                                                 } catch (_: Exception) {}
@@ -1448,8 +1516,6 @@ fun MainScreen(context: Context) {
                                 }) { Text("停止测量") }
                             }
 
-                            Button(onClick = { showParamDialog = true }) { Text("调节参数") }
-
                             Button(onClick = {
                                 scope.launch {
                                     measuring = false
@@ -1470,11 +1536,28 @@ fun MainScreen(context: Context) {
                                 }
                             }) { Text("返回") }
                         }
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { showParamDialog = true }) { Text("调节参数") }
+                            Button(onClick = { forceResetFilter(bpFilter) }) { Text("重置滤波") }
+                        }
                     }
 
                     item {
                         // EMG bar summary
                         EMGBar(strength = emgStrength, fatigue = emgFatigue, strengthIndex = strengthIndex, fatigueIndex = fatigueIndex, strengthMax = strengthMax, modifier = Modifier.fillMaxWidth().height(64.dp))
+                    }
+
+                    // 简单原始记录控制
+                    item {
+                        if (!simpleRawRecording) {
+                            OutlinedButton(onClick = { startSimpleRawRecording() }, modifier = Modifier.fillMaxWidth()) {
+                                Text("开始原始记录")
+                            }
+                        } else {
+                            OutlinedButton(onClick = { stopAndSaveSimpleRawRecording() }, modifier = Modifier.fillMaxWidth()) {
+                                Text("停止并保存原始记录")
+                            }
+                        }
                     }
 
                     item {

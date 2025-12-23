@@ -72,6 +72,11 @@ adb uninstall com.example.reskit
   - 某些情况下连接后设备返回 onFail（args=[1]），需要重启仪器再测；请在仪器侧确认采样参数与状态。
 
 ## Update Log (新增说明，不改动旧内容)
+- **数据流最新调整（与 app/libs/readme.md 同步）**：
+  - 通知分流：Sensor 通道按小端拆分 `appData` 为 short 流，每 9 点取组内首个非零；EMG 通道 `parserEMGData` 后同样 9 取 1，输出诊断（Δt、devTs、nzRate）。
+  - 核心处理：先写入原始点缓冲 `rawCapture`，再用约 300ms 中值扣除基线后带通滤波 20–450 Hz（fs=1000 Hz 假设）；图表每 5 点抽样（~200 Hz），20 ms 节流；指标每 20 点（~50 Hz）用全速序列算 RMS/中值频率生成 `emgStrength`/`emgFatigue`。
+  - 原始数据导出：导出 `rawCapture`（约 1000 Hz 单点流）到 `emg_raw_yyyyMMdd_HHmmss_<dur>s.csv`；包级真实点仍存 `rawPacketCapture`（EMG 9 取 1）。
+  - 简单原始记录：测量页“开始/停止并保存原始记录”按钮，直接存处理前样本，不做滤波/抽样。
 - **UI & 控件布局调整**：测量页顶部为“开始/停止”“调节参数”“返回”三按钮同排；参数调节集中在弹窗，释放更多空间给 EMG Bar 与波形。
 - **性能与刷新节流**：EMG 指标计算节流（每 40 个样本），图表/状态更新加 30ms 节流；强度采用窗口内绝对值前 8 点均值，减少抖动。
 - **后台计算**：RMS/频域计算转至 `Dispatchers.Default`，主线程仅做快照与结果回写，降低长时间运行卡顿风险。
@@ -149,4 +154,33 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 cd E:\projects\andr_s\Reskit
 .\gradlew.bat assembleRelease
 ```
-生成 app-release-unsigned.apk，需要用 keystore 签名并 zipalign 后再安装；如需签名脚本或 keystore 配置，我可以帮你补。
+
+
+## 当前应用内的数据流（Reskit App）
+
+本节仅说明 App 侧的实际数据处理链路，不影响上方 SDK 接口文档。
+
+- 通知分流：`NotifyListener.onNotify` 按 `serviceId/commandId` 分两条路径：
+    - Sensor 通道（`SERVICE_ID_SENSOR` + `COMMAND_ID_SENSOR_REPORT_DATA` 且 `emgDataSource == "sensor"`）：直接按小端将 `appData` 切分为 `short` 流，每 9 点一组仅保留组内首个非零样本，送入处理。
+    - EMG 通道（`SERVICE_ID_EMG` + `COMMAND_ID_UPLOAD_EMG_SAMPLE_DATA` 且 `emgDataSource == "emg"`）：`parserEMGData(appData, EMGSampleData)` 读取每帧 `short[] emgData`，同样 9 取 1 只留首个非零样本，定期输出包诊断（Δt、设备时间戳、非零比等）。
+- 核心处理：所有样本统一经 `pushEmgSample`，流程为：
+    - 原样本追加到原始点缓冲 `rawCapture`；
+    - 先用约 300 ms 中值基线扣除，再带通滤波 20–450 Hz（fs=1000 Hz 假设）；
+    - 图表抽样：每 5 点追加一次至 `emgSeries`（~200 Hz），并以 20 ms 节流刷新；
+    - 指标：每 20 点（约 50 Hz）用全速序列计算 RMS/中值频率，生成疲劳 `emgFatigue` 与力量 `emgStrength`。
+- 原始数据保存：
+    - 包级原始 `short`（EMG 通道 9 取 1 后的真实点）存 `rawPacketCapture`；
+    - 点级原始（所有进入处理的真实单点流，约 1000 Hz）存 `rawCapture`；
+    - “导出原始数据” 按 `emg_raw_yyyyMMdd_HHmmss_<dur>s.csv` 写文件，导出 `rawCapture`（1000 Hz 单点序列）。
+- 简单原始记录：可在测量页点击“开始原始记录/停止并保存原始记录”，直接把处理前的样本写入独立缓冲并导出同名规则的 CSV（不做滤波/抽样）。
+
+### 当前已知输入侧问题
+- 观测到的问题：
+    - 数据中含有大量 0，非零比低（日志“nzRate”显示）；
+    - 实测包到达频率/样本率偏离预期（当前按 ~1000 Hz 假设，日志可见 Δt 与累积率）。
+- 相关日志：EMG 通道每 20 包输出诊断行，包含 Δt、设备时间戳 devTs/偏移 devΔ、非零比 nzRate、累计样本 total/nz。
+- 建议排查：
+    - 确认设备端采样频率/通道配置与 `startEMGSample` 参数一致；
+    - 检查上行是否有压缩/抽样或协议头尾，需要按协议去零或重组帧；
+    - 如设备支持，抓取一帧原始 appData 对照协议文档确认字节序与有效负载位置。
+
