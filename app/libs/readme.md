@@ -225,3 +225,37 @@ MBBAppDataHelper.stopEMGSample(SendMbbCallbackInterface cb)
 
 说明：结束采集数据
 
+---
+
+## 当前应用内的数据流（Reskit App）
+
+本节仅说明 App 侧的实际数据处理链路，不影响上方 SDK 接口文档。
+
+- 通知分流：`NotifyListener.onNotify` 按 `serviceId/commandId` 分两条路径：
+    - Sensor 通道（`SERVICE_ID_SENSOR` + `COMMAND_ID_SENSOR_REPORT_DATA` 且 `emgDataSource == "sensor"`）：调用 `parserSensorData(appData)`，从解析结果中尝试提取包含 "emg" 的字段/方法；若未提取到且包非空，用首字节兜底送入后续处理。
+    - EMG 通道（`SERVICE_ID_EMG` + `COMMAND_ID_UPLOAD_EMG_SAMPLE_DATA` 且 `emgDataSource == "emg"`）：`parserEMGData(appData, EMGSampleData)` 读取每帧 `short[] emgData`，去零后进入处理，并定期输出包诊断（Δt、设备时间戳、非零比等）。
+- 核心处理：所有样本统一经 `pushEmgSample`，流程为：
+    - 原样本追加到原始点缓冲 `rawCapture`；
+    - 带通滤波 20–450 Hz（fs=2000 Hz）；
+    - 每 10 点抽样至约 200 Hz 写入 `emgSeries`，并以 20 ms 节流刷新图表；
+    - 周期计算窗口特征（RMS、中值频率），生成疲劳 `emgFatigue` 与力量 `emgStrength`，供 UI 组件实时显示。
+- 原始数据保存：
+    - 包级原始 `short`（EMG 通道）存 `rawPacketCapture`；
+    - 点级原始（所有进入处理的样本）存 `rawCapture`；
+    - “导出原始数据” 按 `emg_raw_yyyyMMdd_HHmmss_<dur>s.csv` 写文件，优先用包级原始，否则用点级。
+- 简单原始记录：可在测量页点击“开始原始记录/停止并保存原始记录”，直接把处理前的样本写入独立缓冲并导出同名规则的 CSV（不做滤波/抽样）。
+
+### 当前已知输入侧问题
+- 导出原始数据的数据源：
+    - 优先来自 EMG 通道 `parserEMGData` 的 `short[] emgData`（保存在 `rawPacketCapture`）；
+    - 若包级为空则使用所有进入 `pushEmgSample` 的点级样本（`rawCapture`）。
+- 观测到的问题：
+    - 数据中含有大量 0，非零比低（日志“nzRate”显示）；
+    - 实测包到达频率/样本率偏离预期（日志诊断显示 Δt 和累积率与 2000 Hz 设定不符）。
+- 相关日志：EMG 通道每 20 包输出诊断行，包含 Δt、设备时间戳 devTs/偏移 devΔ、非零比 nzRate、累计样本 total/nz。
+- 建议排查：
+    - 确认设备端采样频率/通道配置与 `startEMGSample` 参数一致；
+    - 检查上行是否有压缩/抽样或协议头尾，需要按协议去零或重组帧；
+    - 如设备支持，抓取一帧原始 appData 对照协议文档确认字节序与有效负载位置。
+
+

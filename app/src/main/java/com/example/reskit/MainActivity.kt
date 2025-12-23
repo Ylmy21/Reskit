@@ -24,6 +24,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.rememberTopAppBarState
 import androidx.compose.runtime.*
 import androidx.compose.runtime.rememberCoroutineScope
@@ -50,6 +51,10 @@ import android.os.Looper
 import android.os.SystemClock
 import android.content.pm.PackageManager
 import java.util.UUID
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.Date
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.compose.ui.Modifier
@@ -209,35 +214,70 @@ fun Color.lerp(target: Color, fraction: Float): Color {
     )
 }
 
-// Simple 1st-order high-pass + low-pass cascade for 20-450 Hz bandpass (default fs=2000 Hz)
-class SimpleBandpassFilter(
-    private val fs: Float = 2000f,
-    private val fLow: Float = 20f,
-    private val fHigh: Float = 450f
+// Second-order Butterworth HP + LP cascade for 20-450 Hz bandpass (fs=2000 Hz)
+private class Biquad(
+    private val b0: Float,
+    private val b1: Float,
+    private val b2: Float,
+    private val a1: Float,
+    private val a2: Float
 ) {
-    private var hpPrevY = 0f
-    private var hpPrevX = 0f
-    private var lpPrevY = 0f
+    private var x1 = 0f; private var x2 = 0f
+    private var y1 = 0f; private var y2 = 0f
+    fun reset() { x1 = 0f; x2 = 0f; y1 = 0f; y2 = 0f }
+    fun process(x: Float): Float {
+        val y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        x2 = x1; x1 = x
+        y2 = y1; y1 = y
+        return y
+    }
+}
+
+// Fast 2nd-order Butterworth bandpass using biquads (precomputed on init)
+class ButterworthBandpassFilter(
+    fs: Float = 2000f,
+    fLow: Float = 20f,
+    fHigh: Float = 450f
+) {
+    private val hp: Biquad
+    private val lp: Biquad
+
+    init {
+        fun designHP(fc: Float): Biquad {
+            val omega = kotlin.math.tan(Math.PI.toFloat() * fc / fs)
+            val omega2 = omega * omega
+            val norm = 1f / (1f + kotlin.math.sqrt(2f) * omega + omega2)
+            val b0 = norm
+            val b1 = -2f * norm
+            val b2 = norm
+            val a1 = 2f * (omega2 - 1f) * norm
+            val a2 = (1f - kotlin.math.sqrt(2f) * omega + omega2) * norm
+            return Biquad(b0, b1, b2, a1, a2)
+        }
+
+        fun designLP(fc: Float): Biquad {
+            val omega = kotlin.math.tan(Math.PI.toFloat() * fc / fs)
+            val omega2 = omega * omega
+            val norm = 1f / (1f + kotlin.math.sqrt(2f) * omega + omega2)
+            val b0 = omega2 * norm
+            val b1 = 2f * b0
+            val b2 = b0
+            val a1 = 2f * (omega2 - 1f) * norm
+            val a2 = (1f - kotlin.math.sqrt(2f) * omega + omega2) * norm
+            return Biquad(b0, b1, b2, a1, a2)
+        }
+
+        hp = designHP(fLow)
+        lp = designLP(fHigh)
+    }
 
     fun reset() {
-        hpPrevY = 0f; hpPrevX = 0f; lpPrevY = 0f
+        hp.reset(); lp.reset()
     }
 
     fun process(x: Float): Float {
-        val dt = 1f / fs
-        // high-pass alpha = RC/(RC+dt)
-        val rcHigh = 1f / (2f * Math.PI.toFloat() * fLow)
-        val alphaHp = rcHigh / (rcHigh + dt)
-        val yHp = alphaHp * (hpPrevY + x - hpPrevX)
-        hpPrevY = yHp
-        hpPrevX = x
-
-        // low-pass alpha = dt/(RC+dt)
-        val rcLow = 1f / (2f * Math.PI.toFloat() * fHigh)
-        val alphaLp = dt / (rcLow + dt)
-        val yLp = lpPrevY + alphaLp * (yHp - lpPrevY)
-        lpPrevY = yLp
-        return yLp
+        val yHp = hp.process(x)
+        return lp.process(yHp)
     }
 }
 
@@ -304,6 +344,11 @@ fun EMGRawLineChart(title: String, data: List<Float>, centerBias: Float?, modifi
 fun MainScreen(context: Context) {
     var mac by remember { mutableStateOf("") }
     val logs = remember { mutableStateListOf<String>() }
+    val rawCapture = remember { mutableStateListOf<Float>() }
+    var measurementStartMs by remember { mutableStateOf(0L) }
+    val rawPacketCapture = remember { mutableStateListOf<Short>() }
+    var totalPacketSamples by remember { mutableStateOf(0L) }
+    var totalPacketNonZero by remember { mutableStateOf(0L) }
     val scope = rememberCoroutineScope()
     // helper to convert throwable to full stack string
     fun throwableToString(t: Throwable?): String {
@@ -333,11 +378,51 @@ fun MainScreen(context: Context) {
             }
         }
     }
+
+    fun exportRawCapture() {
+        if (rawCapture.isEmpty()) {
+            addLog("无原始数据可导出")
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(context, "无原始数据可导出", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val durSec = if (measurementStartMs > 0L) ((SystemClock.elapsedRealtime() - measurementStartMs).coerceAtLeast(0L) / 1000L) else 0L
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(context, "开始导出原始数据...", Toast.LENGTH_SHORT).show()
+        }
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val file = File(context.getExternalFilesDir(null), "emg_raw_${ts}_${durSec}s.csv")
+                file.bufferedWriter().use { out ->
+                    val data = if (rawPacketCapture.isNotEmpty()) rawPacketCapture.map { it.toFloat() } else rawCapture.toList()
+                    data.forEachIndexed { idx, v ->
+                        out.append(idx.toString())
+                        out.append(',')
+                        out.append(v.toString())
+                        out.append('\n')
+                    }
+                }
+                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    addLog("原始数据已导出: ${file.absolutePath}")
+                    Toast.makeText(context, "导出完成: ${file.name}", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    addLog("导出原始数据失败: ${e.localizedMessage}")
+                    Toast.makeText(context, "导出失败: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
     
     // EMG visualization state: strength [0f..1f], fatigue [0f..1f]
     var emgStrength by remember { mutableStateOf(0.25f) }
     var emgFatigue by remember { mutableStateOf(0.0f) }
     val strengthSeries = remember { mutableStateListOf<Float>() }
+    val emgSeriesFull = remember { mutableStateListOf<Float>() } // 2000 Hz filtered
+    var chartDecimateCounter by remember { mutableStateOf(0) }
     var lastEmgSampleRealtime by remember { mutableStateOf(0L) }
     var sampleLagMs by remember { mutableStateOf(0L) }
     var emgDataSource by remember { mutableStateOf("emg") } // "emg" or "sensor"
@@ -517,7 +602,14 @@ fun MainScreen(context: Context) {
     var showParamDialog by remember { mutableStateOf(false) }
     fun resetLocalState() {
         emgSeries.clear()
+        emgSeriesFull.clear()
+        chartDecimateCounter = 0
+        rawCapture.clear()
+        rawPacketCapture.clear()
+        totalPacketSamples = 0L
+        totalPacketNonZero = 0L
         strengthSeries.clear()
+        measurementStartMs = 0L
         logs.clear()
         emgMetricCounter = 0
         lastEmgArrivalMs = 0L
@@ -955,24 +1047,31 @@ fun MainScreen(context: Context) {
 
             } // end of home UI block
 
-    val bpFilter = remember { SimpleBandpassFilter(fs = 2000f, fLow = 20f, fHigh = 450f) }
+    val bpFilter = remember { ButterworthBandpassFilter(fs = 2000f, fLow = 20f, fHigh = 450f) }
 
     // helper: push a new EMG sample (real BLE 回调调用此函数)
     fun pushEmgSample(sample: Float) {
         if (!measuring || !streaming.get()) return
         val now = android.os.SystemClock.uptimeMillis()
+        rawCapture.add(sample)
         val s = bpFilter.process(sample) // bandpass-filtered, keep signed
 
-        // limit display rate to ~200 Hz
-        if (now - lastDisplayMs < 5L) return else lastDisplayMs = now
+        // keep full-rate filtered series for reference (bounded)
+        emgSeriesFull.add(s)
+        if (emgSeriesFull.size > MAX_EMG_POINTS * 4) emgSeriesFull.removeFirst()
+
+        // decimate to ~200 Hz for chart/metrics (every 10 samples at 2000 Hz)
+        chartDecimateCounter = (chartDecimateCounter + 1) % 10
+        val shouldAppendChart = chartDecimateCounter == 0
 
         // throttle chart/state updates on main thread
         val shouldUpdateChart = now - lastChartUpdateMs >= CHART_THROTTLE_MS
         if (shouldUpdateChart) lastChartUpdateMs = now
 
-        // always enqueue sample to series, but keep buffer bounded
-        emgSeries.add(s)
-        if (emgSeries.size > MAX_EMG_POINTS) emgSeries.removeFirst()
+        if (shouldAppendChart) {
+            emgSeries.add(s)
+            if (emgSeries.size > MAX_EMG_POINTS) emgSeries.removeFirst()
+        }
         lastEmgSampleRealtime = SystemClock.elapsedRealtime()
 
         emgMetricCounter++
@@ -1184,19 +1283,28 @@ fun MainScreen(context: Context) {
                                             emgDatas?.forEach { any ->
                                                 try {
                                                     val shortArr = any?.javaClass?.getDeclaredField("emgData")?.apply { isAccessible = true }?.get(any) as? ShortArray
-                                                    if (shortArr != null) values.addAll(fromShortArray(shortArr))
+                                                    if (shortArr != null) {
+                                                        rawPacketCapture.addAll(shortArr.asList())
+                                                        val nonZero = shortArr.filter { it.toInt() != 0 }
+                                                        totalPacketSamples += shortArr.size
+                                                        totalPacketNonZero += nonZero.size
+                                                        if (nonZero.isNotEmpty()) {
+                                                            values.addAll(nonZero.map { it.toFloat() })
+                                                        }
+                                                    }
                                                 } catch (_: Exception) {}
                                             }
                                             if (values.isNotEmpty()) values.forEach { pushEmgSample(it) }
                                             // latency diagnostic: log every 50 packets
-                                            if (emgPacketCount % 50 == 0) {
+                                            if (emgPacketCount % 20 == 0) {
                                                 val devTs = runCatching { sample.javaClass.methods.firstOrNull { it.name.equals("getDeviceTimeStamp", true) }?.invoke(sample) as? Number }.getOrNull()?.toLong() ?: 0L
                                                 val locTs = runCatching { sample.javaClass.methods.firstOrNull { it.name.equals("getLocalTimeStamp", true) }?.invoke(sample) as? Number }.getOrNull()?.toLong() ?: 0L
                                                 val deltaMs = if (lastEmgArrivalMs > 0) now - lastEmgArrivalMs else -1
                                                 val devDelta = if (lastEmgDeviceTs > 0 && devTs > 0) devTs - lastEmgDeviceTs else -1
                                                 lastEmgArrivalMs = now
                                                 if (devTs > 0) lastEmgDeviceTs = devTs
-                                                addLog("EMG包诊断: Δt=${deltaMs}ms devTs=${devTs} devΔ=${devDelta}ms size=${values.size} locTs=${locTs}")
+                                                val nzRate = if (totalPacketSamples > 0) totalPacketNonZero.toFloat() / totalPacketSamples else 0f
+                                                addLog("EMG包诊断: Δt=${deltaMs}ms devTs=${devTs} devΔ=${devDelta}ms size=${values.size} locTs=${locTs} nzRate=${"%.3f".format(nzRate)} total=${totalPacketSamples} nz=${totalPacketNonZero}")
                                             } else {
                                                 lastEmgArrivalMs = now
                                             }
@@ -1324,6 +1432,8 @@ fun MainScreen(context: Context) {
                                         addLog("未选择设备，无法开始测量")
                                         return@Button
                                     }
+                                    rawCapture.clear()
+                                    measurementStartMs = SystemClock.elapsedRealtime()
                                     measuring = true
                                     toastEnabled = false
                                     addLog("测量开始 (真实数据模式)")
@@ -1365,6 +1475,12 @@ fun MainScreen(context: Context) {
                     item {
                         // EMG bar summary
                         EMGBar(strength = emgStrength, fatigue = emgFatigue, strengthIndex = strengthIndex, fatigueIndex = fatigueIndex, strengthMax = strengthMax, modifier = Modifier.fillMaxWidth().height(64.dp))
+                    }
+
+                    item {
+                        OutlinedButton(onClick = { exportRawCapture() }, modifier = Modifier.fillMaxWidth()) {
+                            Text("导出原始数据")
+                        }
                     }
 
                     // EMG raw line chart (5s window, no grid)
